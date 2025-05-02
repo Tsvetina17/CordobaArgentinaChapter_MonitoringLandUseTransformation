@@ -1,6 +1,12 @@
 run:
 	python __main__.py
 
+predictor_dw:
+	python predictor_dw.py
+
+predictor_cva:
+	python predictor_cva.py
+
 edit:
 	geany Makefile *.py static/*js static/*css templates/*html README.md
 
@@ -15,4 +21,4 @@ runApp:
 	flask --app cordobaApp --debug run
 
 cleanResult:
-	\rm Data/*.png
+	rm -f Data/*.png

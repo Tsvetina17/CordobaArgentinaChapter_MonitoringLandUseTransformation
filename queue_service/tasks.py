@@ -1,56 +1,106 @@
-from celery import Celery
-from typing import Dict, Any
+from celery_app import celery_app
+import ee
+import logging
 
-# Initialize Celery app
-celery_app = Celery("tasks", broker="redis://localhost:6379/0", backend="redis://localhost:6379/0")
+# Changed path to classes
+from demo_processing_prediction.cordobaDataPreprocessor import *
+from demo_processing_prediction.cordobaPredictor import *
 
-# Process image using the model
-# We will use 'polygon' as input but for simplicity refer to it as 'image'
-@celery_app.task(name = "process_image")
-def process_image(data: Dict[str, Any]) -> Dict[str, Any]:
+# Imports related to the database
+# Needs to be adjusted based on the actual implementation
+from models import RequestData, Result
+from sqlalchemy.orm import Session
+
+
+# Task 1: Preprocess the request and get satellite images
+@celery_app.task(name="preprocess_images")
+def preprocess_images(gee_account, gee_credentials_path, days, roi_coords):
     """
-    Process a change detection request using the provided data.
-    Args:
-        data: Dictionary containing:
-            - polygon: List[List[float]]: List of coordinates defining the area of interest
-            - start_date: str: Start date for change detection
-            - end_date: str: End date for change detection
-            - period: str: Time period for analysis (e.g., 'monthly', 'yearly')
+    Task to preprocess the image data by fetching satellite images for the given dates and area of interest (ROI).
+    This task interacts with the CordobaDataPreprocessor to fetch images from Sentinel-2.
     """
     try:
-        # This is a placeholder -  we will add actual processing code here later
-        
-        return {"status": "processed",
-                "message": "Change detection analysis completed successfully",
-                "request_data": {
-                    "area": data["polygon"],
-                    "start_date": data["start_date"],
-                    "end_date": data["end_date"],
-                    "period": data["period"]
-                },
-                # Placeholder for results
-                "results": {
-                    "change_detected": True,
-                    "change_percentage": 10.5,
-                    "affected_area_km2": 2.3
-                }
-        }
+        # Logging for debugging purposes
+        logging.info(f"Starting image preprocessing for dates: {days} and ROI coordinates: {roi_coords}")
+
+        # Create a preprocessor instance
+        preprocessor = CordobaDataPreprocessor(gee_account, gee_credentials_path)
+
+        # This was not included in Pascal's demo version
+        roi = ee.Geometry.Polygon(roi_coords)
+        # Define the area of interest
+        area_of_interest = LongLatBBox.from_ee_geometry(roi)
+
+        # Get the satellite images using Sentinel-2 data
+        preprocessor.nb_max_step_search = 1
+        preprocessor.step_search_image = 30
+        preprocessor.data_source = CordobaDataSource.SENTINEL2
+        images = preprocessor.get_satellite_data(days, area_of_interest)
+
+        # Logging for debugging purposes
+        logging.info(f"Successfully fetched images.")
+
+        # Return images to be used in prediction
+        return images
+    
     except Exception as e:
-        return {"status": "error",
-                "message": str(e),
-                "request_data": data}
+        # Logging for debugging purposes
+        logging.error(f"Error during image preprocessing: {e}")
+        raise Exception(f"Error during image preprocessing: {e}")
 
+# Task 2: Predict deforestation using the preprocessed images and save the result
+@celery_app.task(name="predict_deforestation")
+def predict_deforestation(images, db_session, days, roi_coords):
+    """
+    Task to predict deforestation using the preprocessed images.
+    This task uses the CordobaPredictor module to analyze the images and detect deforestation.
+    It then saves the result to the database for the requested days and roi_coords.
+    """
+    try:
+        # Logging for debugging purposes
+        logging.info(f"Starting deforestation prediction using preprocessed images.")
 
-    # Load the model
-    model = load_model(model_name)
-    
-    # Load the image
-    image = load_image(image_path)
-    
-    # Perform inference
-    prediction = model.predict(image)
-    
-    return {"status": "processed",
-            "message": "Image processed successfully",
-            "input_data": image_data}
+        # Create a predictor instance
+        predictor = CordobaPredictor()
 
+        # Predict the deforestation using dynamic world with a denoising
+        # threshold of 0.5
+        threshold_denoising = 0.5
+        deforest_mask = predictor.predict_dynamic_world(images, "trees", threshold_denoising)
+
+        # Convert the binary mask to ee.Geometry
+        # `deforest_rois` is a list of ee.Geometry, each one is a detected area of
+        # deforestation and should be displayed in the UI
+        deforest_rois = predictor.get_ee_geometry_from_mask(images[1], deforest_mask)
+
+        # Logging for debugging purposes
+        logging.info(f"Successfully predicted deforestation.")
+
+        # Needs to be adjusted based on the implementation of the database
+        # Generate a hash from the request_data (could be a specific identifier like a UUID)
+        request_hash = str(days, roi_coords)
+
+        # Save the deforestation result to the database
+        new_result = Result(request_hash=request_hash, result=deforest_rois)
+        db_session.add(new_result)
+        db_session.commit()
+
+        # Update the status of the request in the database
+        db_session.query(RequestData).filter(RequestData.request_hash == request_hash).update({"status": "completed"})
+        db_session.commit()
+
+        # Logging for debugging purposes
+        logging.info(f"Successfully saved the result for the predicted deforestation in the database.")
+
+        # Return messahe that the task is completed and result saved
+        return {"status": "success", "message": "Deforestation prediction completed and result saved"}
+    
+    except Exception as e:
+        # Update the status of the request in the database
+        db_session.query(RequestData).filter(RequestData.request_hash == request_hash).update({"status": "failed"})
+        db_session.commit()
+
+        # Logging for debugging purposes
+        logging.error(f"Error during deforestation prediction and saving of the result: {e}")
+
+        raise Exception(f"Error during deforestation prediction and saving of the result: {e}")
